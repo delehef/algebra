@@ -29,9 +29,60 @@ use zeroize::Zeroize;
 #[macro_use]
 pub mod arithmetic;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[allow(unsafe_code)]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+fn eq_aarch64<const N: usize>(a: &BigInt<N>, b: &BigInt<N>) -> bool {
+    if N < 8 {
+        a.0 == b.0
+    } else {
+        use core::arch::aarch64::{
+            veorq_u64, vget_lane_u64, vld1q_u64, vqmovn_u64, vreinterpret_u64_u32,
+        };
+
+        const SIMD_U64_WIDTH: usize = 2;
+        let (my_chunks, my_remainder) = a.0.as_chunks::<SIMD_U64_WIDTH>();
+        let (other_chunks, other_remainder) = b.0.as_chunks::<SIMD_U64_WIDTH>();
+
+        unsafe {
+            for (my_chunk, other_chunk) in my_chunks.into_iter().zip(other_chunks.into_iter()) {
+                // vld1_u64_x4
+                let a = vld1q_u64(my_chunk.as_ptr());
+                let b = vld1q_u64(other_chunk.as_ptr());
+                let xor = veorq_u64(a, b);
+                let sat = vqmovn_u64(xor);
+                let res = vreinterpret_u64_u32(sat);
+                if vget_lane_u64(res, 0) != 0 {
+                    return false;
+                }
+            }
+        }
+
+        for (a, b) in my_remainder.iter().zip(other_remainder.iter()) {
+            if a != b {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Copy, Clone, Hash)]
 #[must_use]
 pub struct BigInt<const N: usize>(pub [u64; N]);
+impl<const N: usize> PartialEq for BigInt<N> {
+    #[allow(unreachable_code)]
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            return eq_aarch64(self, other);
+        }
+
+        // This is only reached if none of the SIMD specializations triggered an early return.
+        self.0 == other.0
+    }
+}
+impl<const N: usize> Eq for BigInt<N> {}
 
 impl<const N: usize> Zeroize for BigInt<N> {
     #[inline]
